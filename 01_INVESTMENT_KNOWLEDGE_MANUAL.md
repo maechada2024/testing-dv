@@ -1,7 +1,7 @@
 # 01 — Investment Knowledge Manual
 
 **Gold Trading & Compounding Accumulation System**
-Document class: Academic & practical investment reference · Version 1.0.0 · Base currency: USD per troy ounce (XAU/USD) · Reference FX: 32.50 THB/USD
+Document class: Academic & practical investment reference · Version 1.1.0 · Base currency: USD per troy ounce (XAU/USD) · Reference FX: 32.50 THB/USD
 
 > **Scope and disclaimer.** This manual explains the asset, the mathematics, the market mechanics and the technical theory behind the system. It is education, not investment advice. Product terms (custodian, spread, minimum order, trading hours) change. Confirm them in the product disclosure inside your wallet app before you commit capital.
 
@@ -158,7 +158,31 @@ $$g = p\,\ln(1+r) + (1-p)\,\ln(0.99), \qquad N_{\text{eff}} = \frac{\ln(FV/PV)}{
 | +1.5% | 579.1 trades | 384.1 trades | 287.3 trades |
 | +2.0% | 361.9 trades | 262.3 trades | 205.7 trades |
 
-**Lesson:** at +1.0% per win, each −1.0% loss cancels one whole win. This is why the system (a) exits at breakeven instead of cutting at a loss inside a physical-backed wallet, and (b) prefers +1.5% or better when the RSI regime allows it. At a 70% win rate with −1% losers, a +1.0% plan needs 720 trades, 2.5× the clean model. A +2.0% plan needs 262 trades.
+**Lesson:** at +1.0% per win, each −1.0% loss cancels one whole win. This is why the system (a) favours breakeven exits over panic cuts, caps risk per trade with the R:R gate (§2.5), and (b) prefers +1.5% or better when the RSI regime allows it. At a 70% win rate with −1% losers, a +1.0% plan needs 720 trades, 2.5× the clean model. A +2.0% plan needs 262 trades.
+
+### 2.5 Risk:reward gate and breakeven win rate
+
+Before a bullish entry, the bot measures the trade's reward against its risk (Manual 03, §5.5):
+
+$$SL = \text{SwingLow} - \$5, \qquad TP = \text{Entry} \times 1.015, \qquad RR = \frac{TP - \text{Entry}}{\text{Entry} - SL}$$
+
+It alerts only when `RR ≥ 1.5`. The minimum R:R sets the win rate at which a strategy stops losing money. If every loss is `1R` and every win is `RR × 1R`, expectancy is zero when:
+
+$$p^{*} = \frac{1}{1 + RR}$$
+
+| R:R | Breakeven win rate `p*` |
+|---|---:|
+| 1 : 1.0 | 50.0% |
+| **1 : 1.5 (system minimum)** | **40.0%** |
+| 1 : 2.0 | 33.3% |
+| 1 : 2.72 (case study, Manual 02 §4) | 26.9% |
+| 1 : 3.0 | 25.0% |
+
+**Maximum entry price.** With the target fixed at `t = +1.5%` and a minimum R:R of `m = 1.5`, the condition `Entry·t ≥ m·(Entry − SL)` rearranges to:
+
+$$\text{Entry} \le SL \cdot \frac{m}{m - t} = \frac{SL}{0.99}$$
+
+For a swing low of $4,300.20 (SL $4,295.20), a new buy passes the gate only at or below **$4,338.59**. Chasing price well above the divergence low is exactly what the gate prevents.
 
 ---
 

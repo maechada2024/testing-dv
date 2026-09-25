@@ -1,7 +1,7 @@
 # 03 — Programmer Technical Manual
 
 **Gold Trading & Compounding Accumulation System: Technical Specification & Implementation Guide**
-Version 1.0.0 · Implementation: `04_GOLD_BOT_MONITOR_ENGINE.py` · Language: Python ≥ 3.9 (tested on 3.11)
+Version 1.1.0 · Implementation: `04_GOLD_BOT_MONITOR_ENGINE.py` · Language: Python ≥ 3.9 (tested on 3.11)
 
 ---
 
@@ -65,7 +65,9 @@ flowchart LR
     IND --> DET["DivergenceEngine.scan()<br/>find_peaks(high) / find_peaks(-low)"]
     DET -->|Divergence| DEB{"StateStore<br/>should_alert?"}
     DEB -->|no| DROP["log & skip"]
-    DEB -->|yes| CH["render_signal_chart()<br/>mplfinance → BytesIO"]
+    DEB -->|yes| RR{"R:R gate (bullish)<br/>evaluate_signal_rr ≥ 1.5?"}
+    RR -->|no| SKIP["log once, not marked<br/>(re-evaluated next poll)"]
+    RR -->|yes / bearish| CH["render_signal_chart()<br/>mplfinance → BytesIO"]
     REG --> CAP
     CH --> CAP["build_caption()<br/>Markdown ≤ 1024 chars"]
     CAP --> TG["TelegramDispatcher<br/>POST /bot&lt;TOKEN&gt;/sendPhoto"]
@@ -104,6 +106,9 @@ flowchart LR
                                    └──────────────────┬──────────────────┘
                                                       ▼
                                           StateStore.mark_alerted (atomic)
+
+  Between the StateStore check and chart rendering, bullish signals pass the R:R gate
+  (§5.5): SL = swing low − $5, TP = +1.5%, alert only if reward/risk ≥ 1.5.
 ```
 
 ### 2.3 Module map (`04_GOLD_BOT_MONITOR_ENGINE.py`)
@@ -117,6 +122,7 @@ flowchart LR
 | Indicators | `wilder_smooth`, `wilder_rsi`, `wilder_rsi_reference`, `ema`, `wilder_atr`, `compute_indicators`, `classify_regime` | Maths |
 | Detection | `Divergence`, `DivergenceEngine` | Pivots, rules, freshness |
 | Analytics | `PositionSnapshot` | P/L in USD and THB, target prices |
+| Risk / reward | `RiskRewardEvaluation`, `evaluate_trade_risk_reward`, `evaluate_signal_rr` | Pre-entry SL/TP, R:R gate, money at risk per lot |
 | Charting | `render_signal_chart`, `CHART_STYLE` | In-memory PNG |
 | Messaging | `build_caption`, `recommended_actions`, `md_escape`, `TelegramDispatcher` | Telegram |
 | State | `StateStore` | Debounce and cooldown persistence |
@@ -187,7 +193,7 @@ timestamp (UTC)             open      high      low       close     volume  rsi 
   "last_by_kind": {
     "BULLISH": "2026-09-24T10:05:00+00:00"
   },
-  "version": "1.0.0"
+  "version": "1.1.0"
 }
 ```
 
@@ -354,6 +360,52 @@ def scan(df):
 
 `find_peaks` is O(n). The backward pair scan is bounded by `MAX_PIVOT_GAP / PIVOT_DISTANCE ≈ 8` candidates. A full cycle on ~320–500 bars (validation, indicators, 4H regime, both scans) runs in about 20 ms. Chart rendering (~0.3 s) dominates, and it only runs when a signal fires.
 
+### 5.5 Risk / reward gate (bullish entries)
+
+Every bullish divergence that passes the rules above is evaluated **before** anything is sent:
+
+| Quantity | Formula | Default |
+|---|---|---|
+| Entry | Close of the last closed candle | — |
+| Swing low | `Divergence.price2` (the second, newer trough low) | — |
+| Stop loss | `swing_low − SL_BUFFER_USD` | buffer **$5.00** (anti stop-hunt) |
+| Take profit | `entry × (1 + RR_TARGET_GAIN_PCT)` | **+1.5%** (`0.015`) |
+| Risk / oz | `entry − stop_loss` | — |
+| Reward / oz | `take_profit − entry` | — |
+| R:R | `reward_per_oz ÷ risk_per_oz` | must be ≥ **`MIN_RR` = 1.5** |
+| Money | `per-oz × LOT_SIZE_OZ` (USD), `× USD_THB` (THB) | lot **0.05 oz** |
+
+```python
+def evaluate_trade_risk_reward(entry_price, swing_low, buffer_usd=5.0, *,
+                               lot_oz=0.05, fx_rate=32.50, target_gain_pct=0.015, min_rr=1.5):
+    stop_loss     = swing_low - buffer_usd
+    target_price  = entry_price * (1 + target_gain_pct)
+    risk_per_oz   = entry_price - stop_loss
+    reward_per_oz = target_price - entry_price
+    if risk_per_oz <= 0:                           # already at/below the stop: invalid setup
+        rr_ratio, is_viable = NaN, False
+    else:
+        rr_ratio  = reward_per_oz / risk_per_oz
+        is_viable = rr_ratio >= min_rr
+    reason     = f"R:R 1:{rr_ratio:.2f} vs minimum 1:{min_rr:.2f}"   # logged when skipped
+    risk_usd   = max(risk_per_oz, 0) * lot_oz
+    reward_usd = reward_per_oz * lot_oz
+    return is_viable, RiskRewardEvaluation(is_viable, entry_price, swing_low, stop_loss, target_price,
+                                           rr_ratio, risk_per_oz, reward_per_oz, lot_oz, fx_rate,
+                                           risk_usd, risk_usd * fx_rate, reward_usd, reward_usd * fx_rate,
+                                           min_rr, reason)
+```
+
+**Behaviour in `GoldMonitorBot.run_cycle`:**
+
+- The function **always** returns an evaluation (never `None`). An invalid setup has `is_viable=False` and `rr_ratio=NaN`, so a caller reading `rr_ratio` for a log line never crashes.
+- **Rejected** signals are **not** sent and **not** marked as alerted. While the divergence stays fresh (≤ 3 candles) it is re-evaluated on every poll, so a pullback toward the swing low that improves R:R can still produce the alert. The rejection is logged once per signal and reason: `Skipped signal BULLISH:<t2>: unfavourable R:R 1:0.89 < minimum 1:1.50`.
+- **Accepted** signals carry the evaluation into the caption (Thai-language R:R block) and the chart (SL and TP dash-dot lines on the price panel).
+- Bearish signals are exit alerts and bypass the gate.
+- `RR_GATE_ENABLED=false` (or `--no-rr-gate`) restores ungated bullish alerts.
+
+**Equivalent entry ceiling:** `R:R ≥ m` with target `t` holds exactly when `entry ≤ SL · m / (m − t)`. With the defaults that is `entry ≤ SL / 0.99`.
+
 ---
 
 ## 6. Charting Engine (In-Memory)
@@ -374,7 +426,8 @@ apds = [
 ]
 fig, axes = mpf.plot(view, type="candle", style=CHART_STYLE, addplot=apds,
                      alines=dict(alines=[[(t1, price1), (t2, price2)]], colors=[div_color]),
-                     hlines=dict(hlines=[entry_price], linestyle="-."),     # only if a position is set
+                     hlines=dict(hlines=[entry_price, stop_loss, target_price],   # each only if present
+                                 colors=["#546e7a", "#c62828", "#2e7d32"], linestyle="-."),
                      panel_ratios=(3, 1.3), returnfig=True)
 buf = io.BytesIO()
 fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
@@ -384,7 +437,7 @@ png_bytes = buf.getvalue()
 
 Implementation notes:
 
-- **The RSI-panel horizontal lines are constant-valued `make_addplot` series with `linestyle="--"`.** mplfinance's `hlines=` keyword draws on the **main (price) panel only**, so it is used there for the entry-price line. The dashed 30/35/55/70 lines therefore need addplots.
+- **The RSI-panel horizontal lines are constant-valued `make_addplot` series with `linestyle="--"`.** mplfinance's `hlines=` keyword draws on the **main (price) panel only**, so it is used there for the entry-price line and, on bullish alerts that passed the R:R gate, the stop-loss (red) and take-profit (green) levels. The dashed 30/35/55/70 lines therefore need addplots.
 - **The RSI divergence trendline** is also an addplot, because `alines=` only targets panel 0.
 - **Backend:** `matplotlib.use("Agg")` is set before importing pyplot, so the daemon runs headless.
 - **Style:** teal/red candles (`#26a69a` / `#ef5350`), `charles` base, dotted light grid, white background.
@@ -394,16 +447,19 @@ Implementation notes:
 
 ## 7. Telegram Dispatcher
 
-**Endpoint:** `POST https://api.telegram.org/bot<TOKEN>/sendPhoto` as `multipart/form-data`:
+**Endpoints:** `POST https://api.telegram.org/bot<TOKEN>/sendPhoto` as `multipart/form-data`, plus `POST https://api.telegram.org/bot<TOKEN>/sendMessage` for caption overflow:
 
 | Part | Value |
 |---|---|
 | `chat_id` | `TELEGRAM_CHAT_ID` (user id, group id starting with `-100`, or `@channel`) |
 | `photo` | `("gold_signal.png", <bytes>, "image/png")` |
-| `caption` | Markdown text, ≤ 1024 characters |
+| `caption` | Markdown text, ≤ 1024 UTF-16 code units |
+| `text` (`sendMessage`) | Overflow part of the alert text |
 | `parse_mode` | `Markdown` (legacy) |
 
-**Retry policy:**
+**Caption length and splitting.** Telegram counts caption length in UTF-16 code units, so emoji such as 🟢 💰 🎯 🛑 📌 count as 2. `telegram_length()` measures that way. `split_caption()` keeps whole lines together and prefers the last `━━━` section divider that fits. The head goes on the photo, and the rest is sent right after as a `sendMessage`. If that follow-up fails after retries, the error is logged but the alert still counts as delivered, because the chart and key figures already arrived. Re-sending the photo would duplicate it.
+
+**Retry policy** (applies to both calls):
 
 | Response | Behaviour |
 |---|---|
@@ -413,10 +469,12 @@ Implementation notes:
 | 5xx / network error | Exponential backoff 2 s, 4 s, 8 s, up to 4 attempts |
 | Other 4xx (401, 403, 404) | Raise `DispatchError` immediately (configuration problem) |
 
-**Caption structure** (actual self-test output; legacy Markdown; dynamic text is escaped by `md_escape` for `_ * \` [`):
+**Bullish alert with R:R block** (actual self-test output; legacy Markdown; dynamic text is escaped by `md_escape` for `_ * \` [`).
+
+Photo caption (843 UTF-16 units):
 
 ```
-🟢 *BULLISH DIVERGENCE - ENTRY WATCH*
+🟢 *[สัญญาณซื้อผ่านเกณฑ์ R:R] Bullish Divergence 1H*
 *XAU/USD* · 1H · `24 Sep 2026 17:00 Asia/Bangkok`
 ━━━━━━━━━━━━━━━━
 *Price:* `$4,249.72`
@@ -430,15 +488,27 @@ RSI higher low `20.3 → 31.9`
 *Position:* 0.10 oz @ `$4,262.52`
 *P/L:* `-$1.28` | `-41.59 THB` (-0.30%)
 ━━━━━━━━━━━━━━━━
+💰 *ราคาเข้าซื้อ (Entry):* `$4,249.72`
+🎯 *เป้าทำกำไร (+1.5%):* `$4,313.47`
+🛑 *จุดตัดขาดทุน (SL):* `$4,232.79` (Low $4,237.79 - $5.00)
+⚖️ *Risk / Reward (0.05 oz):* R:R `1 : 3.76` (ขั้นต่ำ 1 : 1.50)
+• กำไรเป้าหมาย: `+$3.19 USD` (~`104 บาท`)
+• ความเสี่ยงสูงสุด: `-$0.85 USD` (~`28 บาท`)
+📌 *สถานะ:* ความคุ้มค่าผ่านเกณฑ์ (เสี่ยง ~28 บ. เพื่อลุ้นกำไร ~104 บ.)
+```
+
+Follow-up message (304 UTF-16 units):
+
+```
+━━━━━━━━━━━━━━━━
 *Action:*
 1. HOLD the physical position. Do NOT sell into RSI < 30 - the wallet has no margin call.
 2. Averaging is allowed ONLY if it was pre-planned; never exceed your max allocation.
 3. 4H regime is in transition: size small and respect the +1.0% first target.
-4. Targets: +1.0% $4,305.15 | +1.5% $4,326.46 | +2.0% $4,347.77
 _Not financial advice._
 ```
 
-If a caption ever exceeds 1024 characters, action lines are dropped from the end (header, prices and P/L are preserved) and the result is hard-truncated as a last resort.
+Bearish alerts and bullish alerts with `RR_GATE_ENABLED=false` use the same layout without the R:R block. Their header reads `🔴 *BEARISH DIVERGENCE - EXIT WATCH*` or `🟢 *BULLISH DIVERGENCE - ENTRY WATCH*`, and they usually fit in one caption.
 
 **Getting credentials:** create a bot with **@BotFather** (`/newbot`) to get the token. Send the bot a message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `message.chat.id`. For a channel, add the bot as an administrator and use `@channelname` or the numeric id that starts with `-100`.
 
@@ -477,6 +547,11 @@ If a caption ever exceeds 1024 characters, action lines are dropped from the end
 | `ENTRY_PRICE` | `--entry-price` | *(unset)* | Average entry (USD/oz). Unset = no position |
 | `USD_THB` | `--usd-thb` | `32.50` | FX for THB P/L |
 | `PROFIT_TARGETS_PCT` | — | `1.0,1.5,2.0,3.0` | Target ladder |
+| `RR_GATE_ENABLED` | `--no-rr-gate` (disables) | `true` | Filter bullish alerts by R:R |
+| `LOT_SIZE_OZ` | `--lot-size-oz` | `0.05` | Lot used for the R:R money figures |
+| `MIN_RR` | `--min-rr` | `1.5` | Minimum reward:risk (1 : 1.5) |
+| `RR_TARGET_GAIN_PCT` | — | `0.015` | Take-profit for the R:R gate (decimal, +1.5%) |
+| `SL_BUFFER_USD` | — | `5.0` | Stop distance below the swing low (USD/oz) |
 | `RSI_PERIOD` / `EMA_FAST` / `EMA_SLOW` / `ATR_PERIOD` | — | `14` / `50` / `200` / `14` | Indicator periods |
 | `PIVOT_DISTANCE` | — | `5` | `find_peaks` distance |
 | `PIVOT_PROMINENCE_ATR` | — | `0.6` | Prominence as a multiple of median ATR |
@@ -617,12 +692,12 @@ ENTRYPOINT ["python", "/app/04_GOLD_BOT_MONITOR_ENGINE.py"]
 ```
 
 ```bash
-docker build -t gold-bot:1.0.0 .
-docker run --rm gold-bot:1.0.0 --self-test
+docker build -t gold-bot:1.1.0 .
+docker run --rm gold-bot:1.1.0 --self-test
 docker run -d --name gold-bot --restart unless-stopped \
   --env-file /etc/gold-bot/gold-bot.env \
   -v gold-bot-data:/data \
-  gold-bot:1.0.0
+  gold-bot:1.1.0
 docker logs -f gold-bot
 ```
 
@@ -670,11 +745,13 @@ python 04_GOLD_BOT_MONITOR_ENGINE.py --self-test ; echo "exit=$?"
 | Bearish scenario | Detects BEARISH; no false BULLISH; `price2 ≥ price1·0.999`, `rsi2 < rsi1`, `rsi2 ≥ 55` |
 | Freshness | `1 ≤ bars_since_pivot ≤ 3`; an unconfirmed pivot (no closing candle after it) is not signalled |
 | Chart | Output is a valid PNG (signature check, > 20 KB) |
-| Caption | ≤ 1024 characters; includes USD and THB P/L |
+| Caption | Photo caption ≤ 1024 UTF-16 units after splitting; head + overflow reassemble losslessly; includes USD and THB P/L |
+| R:R evaluator | SL = low − $5 and TP = +1.5%; R:R 1 : 2.72 for entry 4,319 / low 4,300.20; risk $1.19 / 41.65 THB at 0.05 oz and 35 THB/USD; far entry rejected; entry below stop → invalid, evaluation still returned |
+| R:R gate | Bullish caption carries the R:R block; with a $60 buffer the same signal is rejected, nothing is sent and the key is not marked alerted |
 | Debounce | A second cycle on identical data dispatches nothing |
 | Walk-forward (informational) | Counts unique signals over 1,250 simulated bars |
 
-Exit code `0` = pass, `1` = failure (suitable for CI and for `docker run --rm gold-bot:1.0.0 --self-test` as a deployment gate).
+Exit code `0` = pass, `1` = failure (suitable for CI and for `docker run --rm gold-bot:1.1.0 --self-test` as a deployment gate).
 
 ### 12.2 Importing the module in your own tests
 

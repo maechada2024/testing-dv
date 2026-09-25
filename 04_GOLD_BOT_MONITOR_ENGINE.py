@@ -22,6 +22,8 @@ Signal rules (1H timeframe):
                          rsi2   >  rsi1            (higher RSI low)
                          rsi2   <= 35.0 and rsi1 < 30.0
     Freshness          : the second pivot must be confirmed within the last 3 closed candles.
+    R:R gate (bullish) : SL = swing low (price2) - $5 buffer, TP = entry x 1.015;
+                         alert only when reward / risk >= 1.5 (sized for a 0.05 oz lot).
 
 Data sources:
 
@@ -72,7 +74,7 @@ import pandas as pd  # noqa: E402
 import requests  # noqa: E402
 from scipy.signal import find_peaks  # noqa: E402
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 LOG = logging.getLogger("gold_bot")
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)  # silence font-weight fallback noise
@@ -82,6 +84,13 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_CAPTION_LIMIT = 1024
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+# Money management defaults (overridable via Config / environment)
+LOT_SIZE_OZ = 0.05                 # lot size for a new entry (oz)
+DEFAULT_USD_THB = 32.50            # THB per USD
+MIN_ACCEPTABLE_RR = 1.5            # minimum reward:risk accepted (1 : 1.5 or better)
+DEFAULT_TARGET_GAIN_PCT = 0.015    # standard take-profit target (+1.5%)
+DEFAULT_SL_BUFFER_USD = 5.0        # stop placed this far below the swing low (anti stop-hunt)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -154,8 +163,15 @@ class Config:
     # Position / currency
     position_oz: float = 0.10
     entry_price: Optional[float] = None
-    usd_thb: float = 32.50
+    usd_thb: float = DEFAULT_USD_THB
     profit_targets_pct: Tuple[float, ...] = (1.0, 1.5, 2.0, 3.0)
+
+    # Risk / reward gate for bullish entries
+    rr_gate_enabled: bool = True
+    lot_size_oz: float = LOT_SIZE_OZ
+    min_rr: float = MIN_ACCEPTABLE_RR
+    rr_target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
+    sl_buffer_usd: float = DEFAULT_SL_BUFFER_USD
 
     # Indicators
     rsi_period: int = 14
@@ -211,8 +227,13 @@ class Config:
             sim_start_price=_env_float("SIM_START_PRICE", 4300.0),
             position_oz=_env_float("POSITION_OZ", 0.10),
             entry_price=_env_optional_float("ENTRY_PRICE"),
-            usd_thb=_env_float("USD_THB", 32.50),
+            usd_thb=_env_float("USD_THB", DEFAULT_USD_THB),
             profit_targets_pct=targets,
+            rr_gate_enabled=_env_bool("RR_GATE_ENABLED", True),
+            lot_size_oz=_env_float("LOT_SIZE_OZ", LOT_SIZE_OZ),
+            min_rr=_env_float("MIN_RR", MIN_ACCEPTABLE_RR),
+            rr_target_gain_pct=_env_float("RR_TARGET_GAIN_PCT", DEFAULT_TARGET_GAIN_PCT),
+            sl_buffer_usd=_env_float("SL_BUFFER_USD", DEFAULT_SL_BUFFER_USD),
             rsi_period=_env_int("RSI_PERIOD", 14),
             ema_fast=_env_int("EMA_FAST", 50),
             ema_slow=_env_int("EMA_SLOW", 200),
@@ -261,6 +282,14 @@ class Config:
             errors.append("entry_price must be positive when set")
         if self.usd_thb <= 0:
             errors.append("usd_thb must be positive")
+        if self.lot_size_oz <= 0:
+            errors.append("lot_size_oz must be positive")
+        if self.min_rr <= 0:
+            errors.append("min_rr must be positive")
+        if not (0 < self.rr_target_gain_pct < 1):
+            errors.append("rr_target_gain_pct must be a decimal fraction, e.g. 0.015 for +1.5%")
+        if self.sl_buffer_usd < 0:
+            errors.append("sl_buffer_usd must be >= 0")
         if self.poll_seconds <= 0:
             errors.append("poll_seconds must be positive")
         try:
@@ -821,6 +850,82 @@ class PositionSnapshot:
         return ref * (1.0 + pct / 100.0)
 
 
+@dataclass(frozen=True)
+class RiskRewardEvaluation:
+    """Pre-entry risk/reward assessment for one lot. Money figures are for `lot_oz` ounces."""
+
+    is_viable: bool
+    entry_price: float
+    swing_low: float
+    stop_loss: float
+    target_price: float
+    rr_ratio: float              # reward_per_oz / risk_per_oz; NaN when risk_per_oz <= 0
+    risk_per_oz: float
+    reward_per_oz: float
+    lot_oz: float
+    fx_rate: float
+    risk_usd: float
+    risk_thb: float
+    reward_usd: float
+    reward_thb: float
+    min_rr: float
+    reason: str
+
+
+def evaluate_trade_risk_reward(
+    entry_price: float,
+    swing_low: float,
+    buffer_usd: float = DEFAULT_SL_BUFFER_USD,
+    *,
+    lot_oz: float = LOT_SIZE_OZ,
+    fx_rate: float = DEFAULT_USD_THB,
+    target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT,
+    min_rr: float = MIN_ACCEPTABLE_RR,
+) -> Tuple[bool, RiskRewardEvaluation]:
+    """Evaluate whether a long entry is worth taking before opening the position.
+
+    1. Stop loss   = swing_low - buffer_usd   (below the prior low, e.g. a double bottom, to
+                                               survive a stop hunt)
+    2. Take profit = entry_price * (1 + target_gain_pct)
+    3. risk/oz     = entry - stop,  reward/oz = target - entry,  R:R = reward / risk
+    4. Money       = per-oz distance * lot_oz (USD), * fx_rate (THB)
+
+    Always returns an evaluation (never None). When the entry is already at or below the stop
+    (risk <= 0) the setup is invalid: is_viable is False and rr_ratio is NaN.
+    """
+    stop_loss = swing_low - buffer_usd
+    target_price = entry_price * (1.0 + target_gain_pct)
+    risk_per_oz = entry_price - stop_loss
+    reward_per_oz = target_price - entry_price
+
+    if risk_per_oz <= 0:
+        rr_ratio = float("nan")
+        is_viable = False
+        reason = (f"invalid setup: entry {entry_price:,.2f} is at/below stop {stop_loss:,.2f}")
+    else:
+        rr_ratio = reward_per_oz / risk_per_oz
+        is_viable = rr_ratio >= min_rr
+        reason = (f"R:R 1:{rr_ratio:.2f} {'>=' if is_viable else '<'} minimum 1:{min_rr:.2f}")
+
+    risk_usd = max(risk_per_oz, 0.0) * lot_oz
+    reward_usd = reward_per_oz * lot_oz
+    evaluation = RiskRewardEvaluation(
+        is_viable=is_viable, entry_price=entry_price, swing_low=swing_low, stop_loss=stop_loss,
+        target_price=target_price, rr_ratio=rr_ratio, risk_per_oz=risk_per_oz, reward_per_oz=reward_per_oz,
+        lot_oz=lot_oz, fx_rate=fx_rate, risk_usd=risk_usd, risk_thb=risk_usd * fx_rate,
+        reward_usd=reward_usd, reward_thb=reward_usd * fx_rate, min_rr=min_rr, reason=reason,
+    )
+    return is_viable, evaluation
+
+
+def evaluate_signal_rr(sig: Divergence, entry_price: float, cfg: Config) -> Tuple[bool, RiskRewardEvaluation]:
+    """R:R for a bullish divergence: the latest divergence low (price2) is the swing low."""
+    return evaluate_trade_risk_reward(
+        entry_price=entry_price, swing_low=sig.price2, buffer_usd=cfg.sl_buffer_usd, lot_oz=cfg.lot_size_oz,
+        fx_rate=cfg.usd_thb, target_gain_pct=cfg.rr_target_gain_pct, min_rr=cfg.min_rr,
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # Chart rendering (in memory only)
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -838,7 +943,8 @@ CHART_STYLE = mpf.make_mpf_style(
 RSI_LEVEL_COLORS: Dict[float, str] = {30.0: "#2e7d32", 35.0: "#66bb6a", 55.0: "#fb8c00", 70.0: "#c62828"}
 
 
-def render_signal_chart(df_ind: pd.DataFrame, sig: Optional[Divergence], cfg: Config, title: str) -> bytes:
+def render_signal_chart(df_ind: pd.DataFrame, sig: Optional[Divergence], cfg: Config, title: str,
+                        rr: Optional[RiskRewardEvaluation] = None) -> bytes:
     """Render the last `chart_bars` candles plus RSI panel to PNG bytes. Nothing touches disk."""
     tz = ZoneInfo(cfg.display_tz)
     view = df_ind.iloc[-cfg.chart_bars:].copy()
@@ -872,8 +978,16 @@ def render_signal_chart(df_ind: pd.DataFrame, sig: Optional[Divergence], cfg: Co
             i1, i2 = view.index.get_loc(rt1), view.index.get_loc(rt2)
             line.iloc[i1 : i2 + 1] = np.linspace(sig.rsi1, sig.rsi2, i2 - i1 + 1)
             apds.append(mpf.make_addplot(line, panel=1, color=div_color, width=2.0, ylim=(0, 100)))
+    levels: List[float] = []
+    colors: List[str] = []
     if cfg.entry_price is not None and cfg.position_oz > 0:
-        kwargs["hlines"] = dict(hlines=[cfg.entry_price], colors=["#546e7a"], linestyle="-.", linewidths=0.9)
+        levels.append(cfg.entry_price)
+        colors.append("#546e7a")
+    if rr is not None:
+        levels.extend([rr.stop_loss, rr.target_price])
+        colors.extend(["#c62828", "#2e7d32"])
+    if levels:
+        kwargs["hlines"] = dict(hlines=levels, colors=colors, linestyle="-.", linewidths=0.9)
 
     fig, _axes = mpf.plot(
         view[["open", "high", "low", "close", "volume"]],
@@ -921,7 +1035,8 @@ def fmt_thb(x: float, signed: bool = False) -> str:
     return f"{sign}{abs(x):,.2f} THB"
 
 
-def recommended_actions(sig: Divergence, pos: PositionSnapshot, ctx: RegimeContext, cfg: Config) -> List[str]:
+def recommended_actions(sig: Divergence, pos: PositionSnapshot, ctx: RegimeContext, cfg: Config,
+                        include_targets: bool = True) -> List[str]:
     t1, t15, t2 = (pos.target_price(p) for p in (1.0, 1.5, 2.0))
     actions: List[str] = []
     if sig.kind == "BULLISH":
@@ -931,7 +1046,7 @@ def recommended_actions(sig: Divergence, pos: PositionSnapshot, ctx: RegimeConte
         elif pos.is_open:
             actions.append("Position already in profit - keep it; do not chase a second entry at a worse price.")
         else:
-            actions.append(f"ENTRY WATCH: consider a planned tranche ({cfg.position_oz:.2f} oz) after the "
+            actions.append(f"ENTRY WATCH: consider a planned tranche ({cfg.lot_size_oz:.2f} oz) after the "
                            "next 1H candle closes above the signal candle high.")
         if ctx.regime == "BEAR_RANGE":
             actions.append("4H is in a BEAR range: expect the bounce to stall at RSI 55-60 - take profit early.")
@@ -939,7 +1054,8 @@ def recommended_actions(sig: Divergence, pos: PositionSnapshot, ctx: RegimeConte
             actions.append("4H is in a BULL range: dip-buy context is favourable; 1H RSI 40-50 should hold.")
         else:
             actions.append("4H regime is in transition: size small and respect the +1.0% first target.")
-        actions.append(f"Targets: +1.0% {fmt_usd(t1)} | +1.5% {fmt_usd(t15)} | +2.0% {fmt_usd(t2)}")
+        if include_targets:
+            actions.append(f"Targets: +1.0% {fmt_usd(t1)} | +1.5% {fmt_usd(t15)} | +2.0% {fmt_usd(t2)}")
     else:
         if pos.is_open and pos.pnl_pct >= 1.0:
             actions.append(f"TAKE PROFIT: position is {pos.pnl_pct:+.2f}% - sell all or at least half now.")
@@ -961,15 +1077,31 @@ def recommended_actions(sig: Divergence, pos: PositionSnapshot, ctx: RegimeConte
     return actions
 
 
+def rr_caption_lines(rr: RiskRewardEvaluation) -> List[str]:
+    """Thai-language R:R block for a bullish entry (legacy Markdown)."""
+    return [
+        f"💰 *ราคาเข้าซื้อ (Entry):* `{fmt_usd(rr.entry_price)}`",
+        f"🎯 *เป้าทำกำไร (+{(rr.target_price / rr.entry_price - 1) * 100:.1f}%):* `{fmt_usd(rr.target_price)}`",
+        f"🛑 *จุดตัดขาดทุน (SL):* `{fmt_usd(rr.stop_loss)}` (Low {fmt_usd(rr.swing_low)} - "
+        f"{fmt_usd(rr.swing_low - rr.stop_loss)})",
+        f"⚖️ *Risk / Reward ({rr.lot_oz:.2f} oz):* R:R `1 : {rr.rr_ratio:.2f}` (ขั้นต่ำ 1 : {rr.min_rr:.2f})",
+        f"• กำไรเป้าหมาย: `+${rr.reward_usd:.2f} USD` (~`{rr.reward_thb:,.0f} บาท`)",
+        f"• ความเสี่ยงสูงสุด: `-${rr.risk_usd:.2f} USD` (~`{rr.risk_thb:,.0f} บาท`)",
+        f"📌 *สถานะ:* ความคุ้มค่าผ่านเกณฑ์ (เสี่ยง ~{rr.risk_thb:,.0f} บ. เพื่อลุ้นกำไร ~{rr.reward_thb:,.0f} บ.)",
+    ]
+
+
 def build_caption(
-    sig: Divergence, df_ind: pd.DataFrame, pos: PositionSnapshot, ctx: RegimeContext, cfg: Config
+    sig: Divergence, df_ind: pd.DataFrame, pos: PositionSnapshot, ctx: RegimeContext, cfg: Config,
+    rr: Optional[RiskRewardEvaluation] = None,
 ) -> str:
     tz = ZoneInfo(cfg.display_tz)
     last = df_ind.iloc[-1]
     ts_local = df_ind.index[-1].tz_convert(tz)
     rule = "━━━━━━━━━━━━━━━━"
     if sig.kind == "BULLISH":
-        head = "🟢 *BULLISH DIVERGENCE - ENTRY WATCH*"
+        head = ("🟢 *[สัญญาณซื้อผ่านเกณฑ์ R:R] Bullish Divergence 1H*" if rr is not None
+                else "🟢 *BULLISH DIVERGENCE - ENTRY WATCH*")
         struct = (f"Price lower low `{fmt_usd(sig.price1)} → {fmt_usd(sig.price2)}`\n"
                   f"RSI higher low `{sig.rsi1:.1f} → {sig.rsi2:.1f}`")
     else:
@@ -994,18 +1126,46 @@ def build_caption(
                      f"({pos.pnl_pct:+.2f}%)")
     else:
         lines.append("*Position:* none configured (set ENTRY\\_PRICE)")
+    if rr is not None:
+        lines.append(rule)
+        lines.extend(rr_caption_lines(rr))
     lines.append(rule)
     lines.append("*Action:*")
-    lines.extend(f"{i}. {md_escape(a)}" for i, a in enumerate(recommended_actions(sig, pos, ctx, cfg), 1))
+    actions = recommended_actions(sig, pos, ctx, cfg, include_targets=rr is None)
+    lines.extend(f"{i}. {md_escape(a)}" for i, a in enumerate(actions, 1))
     lines.append("_Not financial advice._")
-    caption = "\n".join(lines)
-    if len(caption) > TELEGRAM_CAPTION_LIMIT:
-        # Drop action lines from the end (never the header/prices) until it fits.
-        while len(caption) > TELEGRAM_CAPTION_LIMIT and len(lines) > 12:
-            lines.pop(-2)
-            caption = "\n".join(lines)
-        caption = caption[:TELEGRAM_CAPTION_LIMIT]
-    return caption
+    return "\n".join(lines)
+
+
+def telegram_length(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units (emoji outside the BMP count as 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_caption(text: str, limit: int = TELEGRAM_CAPTION_LIMIT) -> Tuple[str, str]:
+    """Split on line boundaries into (photo caption <= limit, overflow text).
+
+    Whole lines are kept together so Markdown entities are never cut in half, and the split
+    prefers the last section divider (━━━) that fits so a section is never torn apart. A single
+    line longer than the limit (never produced by build_caption) is hard-cut as a last resort.
+    """
+    if telegram_length(text) <= limit:
+        return text, ""
+    lines = text.split("\n")
+    head: List[str] = []
+    for i, line in enumerate(lines):
+        candidate = "\n".join(head + [line])
+        if telegram_length(candidate) > limit:
+            if not head:
+                cut = line
+                while telegram_length(cut) > limit:
+                    cut = cut[:-1]
+                return cut, "\n".join([line[len(cut):]] + lines[i + 1:])
+            dividers = [j for j in range(1, i) if lines[j].startswith("━")]
+            j = dividers[-1] if dividers else i
+            return "\n".join(lines[:j]), "\n".join(lines[j:])
+        head.append(line)
+    return "\n".join(head), ""
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
@@ -1021,25 +1181,37 @@ class TelegramDispatcher:
         self.session = session or requests.Session()
         self.max_attempts = max_attempts
 
-    @property
-    def url(self) -> str:
-        return f"{TELEGRAM_API_BASE}/bot{self.cfg.telegram_token}/sendPhoto"
-
     def send_photo(self, png: bytes, caption: str) -> None:
+        """Send the chart with its caption. A caption longer than Telegram's 1024-unit limit is split
+        on line boundaries: the head rides on the photo, the rest follows as a text message."""
+        head, overflow = split_caption(caption)
         if not self.cfg.telegram_enabled:
-            LOG.info("[DRY-RUN] sendPhoto suppressed (%d bytes PNG). Caption:\n%s", len(png), caption)
+            LOG.info("[DRY-RUN] sendPhoto suppressed (%d bytes PNG). Caption:\n%s", len(png), head)
+            if overflow:
+                LOG.info("[DRY-RUN] sendMessage suppressed (follow-up):\n%s", overflow)
             return
+        self._post("sendPhoto", {"caption": head}, "caption",
+                   files={"photo": ("gold_signal.png", png, "image/png")})
+        if overflow:
+            try:
+                self._post("sendMessage", {"text": overflow}, "text")
+            except DispatchError as exc:
+                # The chart and key figures are already delivered; do not re-send the whole alert.
+                LOG.error("Follow-up message failed (alert photo was delivered): %s", exc)
+
+    def _post(self, method: str, fields: Dict[str, str], text_field: str, files: Optional[dict] = None) -> None:
+        url = f"{TELEGRAM_API_BASE}/bot{self.cfg.telegram_token}/{method}"
         parse_mode: Optional[str] = "Markdown"
         attempt = 0
         delay = 2.0
+        fields = dict(fields)
         while True:
             attempt += 1
-            data = {"chat_id": self.cfg.telegram_chat_id, "caption": caption}
+            data = {"chat_id": self.cfg.telegram_chat_id, **fields}
             if parse_mode:
                 data["parse_mode"] = parse_mode
-            files = {"photo": ("gold_signal.png", png, "image/png")}
             try:
-                resp = self.session.post(self.url, data=data, files=files, timeout=self.cfg.request_timeout)
+                resp = self.session.post(url, data=data, files=files, timeout=self.cfg.request_timeout)
             except requests.RequestException as exc:
                 if attempt >= self.max_attempts:
                     raise DispatchError(f"Telegram network error after {attempt} attempts: {exc}") from exc
@@ -1049,7 +1221,7 @@ class TelegramDispatcher:
                 continue
 
             if resp.status_code == 200:
-                LOG.info("Telegram alert delivered (attempt %d).", attempt)
+                LOG.info("Telegram %s delivered (attempt %d).", method, attempt)
                 return
             try:
                 payload = resp.json()
@@ -1059,7 +1231,7 @@ class TelegramDispatcher:
             if resp.status_code == 400 and parse_mode and "parse" in description.lower():
                 LOG.warning("Telegram rejected Markdown (%s); resending as plain text.", description)
                 parse_mode = None
-                caption = caption.replace("*", "").replace("`", "").replace("\\", "")
+                fields[text_field] = fields[text_field].replace("*", "").replace("`", "").replace("\\", "")
                 continue
             if attempt >= self.max_attempts:
                 raise DispatchError(f"Telegram HTTP {resp.status_code}: {description}")
@@ -1159,6 +1331,7 @@ class GoldMonitorBot:
         self.state = state or StateStore(cfg.state_path, cfg.alert_cooldown_minutes, cfg.state_retention_days)
         self.engine = DivergenceEngine(cfg)
         self._stop = threading.Event()
+        self._rr_rejected: Dict[str, str] = {}   # debounce key -> last logged rejection reason
 
     def stop(self, *_args) -> None:
         LOG.info("Stop requested; finishing current cycle.")
@@ -1181,11 +1354,24 @@ class GoldMonitorBot:
             if not self.state.should_alert(sig, now):
                 LOG.debug("Debounced %s", sig.key)
                 continue
-            pos = PositionSnapshot(self.cfg.position_oz, self.cfg.entry_price, float(last["close"]), self.cfg.usd_thb)
+            price = float(last["close"])
+            rr: Optional[RiskRewardEvaluation] = None
+            if sig.kind == "BULLISH" and self.cfg.rr_gate_enabled:
+                viable, rr = evaluate_signal_rr(sig, price, self.cfg)
+                if not viable:
+                    # Not marked as alerted: while the signal stays fresh it is re-evaluated every
+                    # cycle, so a pullback toward the swing low can still make it viable.
+                    if self._rr_rejected.get(sig.key) != rr.reason:
+                        LOG.info("Skipped signal %s: unfavourable %s", sig.key, rr.reason)
+                        self._rr_rejected[sig.key] = rr.reason
+                    continue
+                self._rr_rejected.pop(sig.key, None)
+            pos = PositionSnapshot(self.cfg.position_oz, self.cfg.entry_price, price, self.cfg.usd_thb)
             title = f"{self.cfg.symbol_label} 1H - {sig.kind.title()} RSI Divergence"
-            png = render_signal_chart(df_ind, sig, self.cfg, title)
-            caption = build_caption(sig, df_ind, pos, ctx, self.cfg)
-            LOG.info("Signal %s price %.2f->%.2f RSI %.1f->%.1f", sig.key, sig.price1, sig.price2, sig.rsi1, sig.rsi2)
+            png = render_signal_chart(df_ind, sig, self.cfg, title, rr)
+            caption = build_caption(sig, df_ind, pos, ctx, self.cfg, rr)
+            LOG.info("Signal %s price %.2f->%.2f RSI %.1f->%.1f%s", sig.key, sig.price1, sig.price2, sig.rsi1,
+                     sig.rsi2, f" | {rr.reason}" if rr is not None else "")
             self.dispatcher.send_photo(png, caption)
             self.state.mark_alerted(sig, now)
             dispatched.append(sig)
@@ -1259,6 +1445,17 @@ def run_self_test(cfg: Config) -> int:
     check(bool(((finite >= 0) & (finite <= 100)).all()), "RSI bounded in [0, 100]")
     check(len(validate_ohlcv(hist, cfg.min_bars)) == 600, "Simulated history satisfies OHLCV contract")
 
+    LOG.info("Self-test: risk/reward evaluator")
+    ok, ev = evaluate_trade_risk_reward(4319.0, 4300.20, 5.0, lot_oz=0.05, fx_rate=35.0)
+    check(abs(ev.stop_loss - 4295.20) < 1e-9 and abs(ev.target_price - 4383.785) < 1e-9, "SL = low - $5, TP = +1.5%")
+    check(abs(ev.rr_ratio - 64.785 / 23.80) < 1e-9 and ok, f"R:R 1:{ev.rr_ratio:.2f} viable (>= 1.5)")
+    check(abs(ev.risk_usd - 1.19) < 1e-9 and abs(ev.risk_thb - 41.65) < 1e-9, "Risk money: $1.19 / 41.65 THB")
+    ok_far, ev_far = evaluate_trade_risk_reward(4360.0, 4300.20, 5.0)
+    check(not ok_far and ev_far.rr_ratio < 1.5, f"Entry far above low rejected (R:R 1:{ev_far.rr_ratio:.2f})")
+    ok_bad, ev_bad = evaluate_trade_risk_reward(4290.0, 4300.20, 5.0)
+    check(not ok_bad and math.isnan(ev_bad.rr_ratio) and ev_bad.risk_usd == 0.0,
+          "Entry below stop -> invalid, evaluation still returned")
+
     for kind in ("BULLISH", "BEARISH"):
         LOG.info("Self-test: %s divergence scenario end-to-end", kind)
         scenario = build_divergence_scenario(kind)
@@ -1286,10 +1483,25 @@ def run_self_test(cfg: Config) -> int:
         if recorder.sent:
             png, caption = recorder.sent[0]
             check(png.startswith(PNG_SIGNATURE) and len(png) > 20_000, f"Chart is a valid PNG ({len(png)} bytes)")
-            check(len(caption) <= TELEGRAM_CAPTION_LIMIT, f"Caption within Telegram limit ({len(caption)} chars)")
+            head, overflow = split_caption(caption)
+            check(telegram_length(head) <= TELEGRAM_CAPTION_LIMIT and caption == "\n".join(p for p in (head, overflow) if p),
+                  f"Photo caption within limit ({telegram_length(head)} UTF-16 units), overflow lossless "
+                  f"({telegram_length(overflow)} units)")
             check("P/L" in caption and "THB" in caption, "Caption carries USD and THB P/L")
+            if kind == "BULLISH":
+                check("R:R" in head and "(SL)" in head, "Bullish photo caption carries the R:R block")
         again = bot.run_cycle(now + timedelta(minutes=1))
         check(len(again) == 0, "Debounce: identical pivot is not re-alerted")
+
+        if kind == "BULLISH":
+            strict_cfg = dataclasses.replace(run_cfg, sl_buffer_usd=60.0)
+            strict_rec = _RecordingDispatcher(strict_cfg)
+            strict_state = StateStore(None, 0, 1)
+            strict_bot = GoldMonitorBot(strict_cfg, provider=_StaticProvider(scenario), dispatcher=strict_rec,
+                                        state=strict_state)
+            check(strict_bot.run_cycle(now) == [] and not strict_rec.sent,
+                  "R:R gate: unfavourable bullish signal is not sent to Telegram")
+            check(not strict_state.alerted, "R:R gate: rejected signal is not marked alerted (re-evaluated later)")
 
         stale = scenario.iloc[:-2]
         stale_bot = GoldMonitorBot(run_cfg, provider=_StaticProvider(stale), dispatcher=_RecordingDispatcher(run_cfg),
@@ -1332,6 +1544,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--position-oz", type=float, help="open position size in troy ounces")
     p.add_argument("--entry-price", type=float, help="average entry price in USD/oz")
     p.add_argument("--usd-thb", type=float, help="USD/THB conversion rate")
+    p.add_argument("--lot-size-oz", type=float, help="lot size (oz) used for the R:R money figures")
+    p.add_argument("--min-rr", type=float, help="minimum reward:risk for bullish alerts (e.g. 1.5)")
+    p.add_argument("--no-rr-gate", action="store_true", help="send bullish alerts without the R:R filter")
     p.add_argument("--poll-seconds", type=float, help="seconds between cycles")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"), help="DEBUG|INFO|WARNING|ERROR")
     return p
@@ -1349,8 +1564,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         overrides = {k: v for k, v in {
             "data_source": args.source, "csv_path": args.csv_path, "state_path": args.state_path,
             "position_oz": args.position_oz, "entry_price": args.entry_price, "usd_thb": args.usd_thb,
-            "poll_seconds": args.poll_seconds,
+            "poll_seconds": args.poll_seconds, "lot_size_oz": args.lot_size_oz, "min_rr": args.min_rr,
         }.items() if v is not None}
+        if args.no_rr_gate:
+            overrides["rr_gate_enabled"] = False
         if args.dry_run:
             overrides["dry_run"] = True
         cfg = dataclasses.replace(cfg, **overrides)
