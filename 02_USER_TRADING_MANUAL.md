@@ -1,7 +1,7 @@
 # 02 — User Trading Manual
 
 **Gold Trading & Compounding Accumulation System: Field Operations Manual**
-Version 1.1.0 · Pricing unit: USD per troy ounce · Reference FX: **32.50 THB/USD** · Timeframe: 1H execution, 4H context
+Version 1.2.0 · Pricing unit: USD per troy ounce · Reference FX: **32.50 THB/USD** · Timeframe: 1H execution, 4H context
 
 > Read `01_INVESTMENT_KNOWLEDGE_MANUAL.md` first for the theory. This manual is what to **do**: lookup tables, checklists, rules and one full trade walked from alert to exit. It is not investment advice.
 
@@ -130,7 +130,7 @@ The monitoring bot (`04_GOLD_BOT_MONITOR_ENGINE.py`) sends a Telegram **photo al
 | A5 | **Size from the 4H regime:** BULL RANGE → full tranche; TRANSITION → half tranche; BEAR RANGE → half tranche, counter-trend scalp rules. | ☐ |
 | A6 | **Execute the buy** in the wallet. Record the **actual** execution price and quantity. | ☐ |
 | A7 | **Set targets** from §1.2: primary target (+1.0% in BEAR/TRANSITION, +1.5% to +2.0% in BULL) and stretch target (+3.0% in BULL only). Set in-app price alerts at those levels. | ☐ |
-| A8 | **Update the bot:** set `ENTRY_PRICE` and `POSITION_OZ` (environment or `--entry-price/--position-oz`) and restart it, so future alerts report your live P/L. | ☐ |
+| A8 | **Update the bot:** set `ENTRY_PRICE` and `POSITION_OZ` (environment or `--entry-price/--position-oz`) and restart it, so future alerts report your live P/L and the trailing stop starts watching the position (SOP-D). In **hard-stop** mode (R6) also set `INITIAL_STOP_LOSS` to your SL; in **physical-hold** mode leave it unset. | ☐ |
 | A9 | **Log the trade** in the journal (§6). | ☐ |
 
 **If you already hold a position** when a bullish alert arrives:
@@ -161,6 +161,21 @@ The monitoring bot (`04_GOLD_BOT_MONITOR_ENGINE.py`) sends a Telegram **photo al
 | No alerts for > 48 h | Normal in quiet trends. Confirm the bot is alive: `systemctl status gold-bot` or `docker logs gold-bot` (Manual 03). |
 | Alert arrives while you are away and is > 3 candles old | The setup is stale. Do **not** enter late; wait for the next one. |
 | Bullish **and** bearish alerts close together | The market is choppy. Stand aside or trade half size. |
+
+### 2.4 SOP-D: Trailing-stop alerts (open position)
+
+While `ENTRY_PRICE` is set, the bot manages the position's stop on every closed 1H candle and sends a **text message** (no chart) when something changes:
+
+| Alert | When | What to do |
+|---|---|---|
+| 🛡️ **[ล็อกทุนเรียบร้อย]** | A 1H close at or above entry × 1.010 (+1.0%) | Nothing to sell. Your stop is now the entry price; set an in-app price alert at that level |
+| 🚀 **[ยกจุดล็อกกำไรสูงขึ้น]** | On a later candle, the highest close minus 0.5% of entry is above the current stop | Move your in-app price alert up to the new stop. The minimum locked-in profit is shown in USD and THB |
+| 🎯 **[สั่งปิดสถานะ]** | A 1H close at or below the stop | **Sell the whole position now** at the wallet's current quote. The message shows the result at the stop level and the estimated result at the current price, which is usually a little worse because the candle closed through the stop |
+| After the sale | — | Remove `ENTRY_PRICE` from the bot configuration and restart it. Until you do, the bot treats the position as closed and sends no further trailing alerts for it |
+
+The exit label tells you which case it was: **ล็อกกำไรสำเร็จ** (stop above entry), **ปิดสถานะเท่าทุน** (stop at entry) or **ตัดขาดทุนตาม SL** (the initial hard stop was hit before the +1.0% lock).
+
+The bot remembers the stop, the highest close and the lock in `gold_bot_state.json`. A restart does not reset them, and candles missed while the bot was down are replayed in order when it comes back.
 
 ---
 
@@ -197,16 +212,23 @@ A **breakeven exit** (a scratch) is a successful outcome whenever the alternativ
 
 ### R4. Trailing stop guidelines
 
-Most wallets do not support resting stop orders, so these are **mental stops backed by in-app price alerts**:
+Most wallets do not support resting stop orders, so these are **mental stops backed by in-app price alerts**. The bot computes them for you (SOP-D):
 
-| Unrealised net gain reached | Move protective level to | Rationale |
+1. **Break-even lock:** the first 1H close at or above **entry + 1.0%** moves the stop to the entry price.
+2. **Trail:** from the next candle on, the stop is the **highest 1H close minus 0.5% of entry**.
+3. **Up only:** the stop never moves down.
+4. **Exit:** a 1H close **at or below** the stop means sell.
+
+Resulting stop levels (the one-candle lag after the lock aside):
+
+| Highest close reached | Stop | Locked-in result |
 |---|---|---|
-| +1.0% | Breakeven (entry price) | The trade can no longer lose |
-| +1.5% | Entry + 0.75% | Lock in half of the move |
-| +2.0% | Entry + 1.25% | Protect a full +1% target |
-| +3.0% | Entry + 2.0%, **or** the most recent 1H close below EMA50, whichever is higher | Let the runner work in a BULL range |
+| +1.0% | Entry (break-even) | 0% |
+| +1.5% | Entry + 1.0% | +1.0% |
+| +2.0% | Entry + 1.5% | +1.5% |
+| +3.0% | Entry + 2.5% | +2.5% |
 
-Trigger: when a **1H candle closes** below the protective level, sell at the next wallet quote. Intrabar wicks do not count, because wicks through obvious levels are often stop runs (Manual 01, §4.2).
+Example, 0.05 oz @ $4,270 (offset 0.5% × 4,270 = $21.35): lock at $4,312.70 → stop $4,270.00; highest close $4,330.00 → stop **$4,308.65**, locking +$1.93 (≈ +63 THB at 32.50). Only 1H closes count, not intrabar wicks, because wicks through obvious levels are often stop runs (Manual 01, §4.2).
 
 ### R5. Behavioural rules
 
@@ -224,8 +246,8 @@ The alert's **SL (swing low − $5)** is the level at which the divergence setup
 
 | Mode | When price **closes** a 1H candle below the SL | Suits |
 |---|---|---|
-| **Hard stop** | Sell at the next wallet quote. Loss is capped near the planned risk. | Traders who want every loss limited to `1R`, as the R:R maths assumes |
-| **Physical hold** (R1) | Do not sell into the flush. Stop adding, cancel the original target and switch to the breakeven exit plan (R3). | Fully paid physical holders who accept a longer, deeper drawdown instead of a realised loss |
+| **Hard stop** | Sell at the next wallet quote. Loss is capped near the planned risk. Set `INITIAL_STOP_LOSS` so the bot sends the 🎯 exit alert. | Traders who want every loss limited to `1R`, as the R:R maths assumes |
+| **Physical hold** (R1) | Do not sell into the flush. Stop adding, cancel the original target and switch to the breakeven exit plan (R3). Leave `INITIAL_STOP_LOSS` unset; the bot then only starts protecting the trade after the +1.0% lock. | Fully paid physical holders who accept a longer, deeper drawdown instead of a realised loss |
 
 Rules for both modes:
 
@@ -264,6 +286,7 @@ Rules for both modes:
 | Exit | 0.10 oz @ $4,321.00 → $432.10 (14,043.25 THB) |
 | Realised result | **+$0.20 / +6.50 THB / +0.046%** |
 | Holding time | ~32 hours |
+| Trailing stop (SOP-D) | Never activated: the highest 1H close ($4,324.10) stayed below the +1.0% lock at $4,362.19. With `INITIAL_STOP_LOSS` unset (physical hold), the bot sent no stop alerts, and the exit came from the bearish-divergence alert |
 | Outcome if panic-sold at the low ($4,280) | −$3.90 / −126.75 THB realised |
 | **Value of following Rule R1** | **+$4.10 / +133.25 THB** versus the panic sale |
 | Outcome in hard-stop mode (R6) | Sold on the first 1H close below the SL ($4,291.00): **−$2.80 / −91.00 THB** realised, a controlled loss slightly worse than the planned 1R ($2.38) because the close gapped past the stop |

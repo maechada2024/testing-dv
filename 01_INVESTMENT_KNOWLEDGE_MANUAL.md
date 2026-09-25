@@ -1,7 +1,7 @@
 # 01 — Investment Knowledge Manual
 
 **Gold Trading & Compounding Accumulation System**
-Document class: Academic & practical investment reference · Version 1.1.0 · Base currency: USD per troy ounce (XAU/USD) · Reference FX: 32.50 THB/USD
+Document class: Academic & practical investment reference · Version 1.2.0 · Base currency: USD per troy ounce (XAU/USD) · Reference FX: 32.50 THB/USD
 
 > **Scope and disclaimer.** This manual explains the asset, the mathematics, the market mechanics and the technical theory behind the system. It is education, not investment advice. Product terms (custodian, spread, minimum order, trading hours) change. Confirm them in the product disclosure inside your wallet app before you commit capital.
 
@@ -411,6 +411,7 @@ RSI
 | **RMA / Wilder smoothing** | `RMA_t = RMA_{t−1} + (x_t − RMA_{t−1})/n`, the EMA with `α = 1/n` |
 | **Selling climax** | Capitulation low where forced selling exhausts, often followed by a secondary test |
 | **Swap fee** | Overnight financing charged or paid on leveraged positions; absent in fully paid physical |
+| **Trailing stop** | A stop that follows price up: in this system, break-even at +1.0%, then the highest 1H close minus 0.5% of entry, never moving down |
 | **Troy ounce** | 31.1034768 g, the international unit for precious metals |
 
 ---

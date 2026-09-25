@@ -1,7 +1,7 @@
 # 03 — Programmer Technical Manual
 
 **Gold Trading & Compounding Accumulation System: Technical Specification & Implementation Guide**
-Version 1.1.0 · Implementation: `04_GOLD_BOT_MONITOR_ENGINE.py` · Language: Python ≥ 3.9 (tested on 3.11)
+Version 1.2.0 · Implementation: `04_GOLD_BOT_MONITOR_ENGINE.py` · Language: Python ≥ 3.9 (tested on 3.11)
 
 ---
 
@@ -72,6 +72,9 @@ flowchart LR
     CH --> CAP["build_caption()<br/>Markdown ≤ 1024 chars"]
     CAP --> TG["TelegramDispatcher<br/>POST /bot&lt;TOKEN&gt;/sendPhoto"]
     TG -->|200 OK| MARK["StateStore.mark_alerted()<br/>atomic JSON write"]
+    IND --> TRL["process_trailing()<br/>TrailingStopManager per new 1H close"]
+    TRL -->|event| MSG["TelegramDispatcher.send_message<br/>(Thai text)"]
+    MSG -->|200 OK| TST["StateStore.set_trailing()<br/>stop · peak · lock · last bar"]
     TG -->|error| RETRY["DispatchError → backoff<br/>(signal stays pending)"]
 ```
 
@@ -123,6 +126,7 @@ flowchart LR
 | Detection | `Divergence`, `DivergenceEngine` | Pivots, rules, freshness |
 | Analytics | `PositionSnapshot` | P/L in USD and THB, target prices |
 | Risk / reward | `RiskRewardEvaluation`, `evaluate_trade_risk_reward`, `evaluate_signal_rr` | Pre-entry SL/TP, R:R gate, money at risk per lot |
+| Trailing stop | `TrailingStopManager`, `TrailingEvent`, `format_trailing_message`, `GoldMonitorBot.process_trailing` | Break-even lock, trailing stop and exit alerts for the open position |
 | Charting | `render_signal_chart`, `CHART_STYLE` | In-memory PNG |
 | Messaging | `build_caption`, `recommended_actions`, `md_escape`, `TelegramDispatcher` | Telegram |
 | State | `StateStore` | Debounce and cooldown persistence |
@@ -193,11 +197,21 @@ timestamp (UTC)             open      high      low       close     volume  rsi 
   "last_by_kind": {
     "BULLISH": "2026-09-24T10:05:00+00:00"
   },
-  "version": "1.1.0"
+  "trailing": {
+    "position_key": "4270.00@0.0500",
+    "last_bar": "2026-09-24T14:00:00+00:00",
+    "initial_stop_loss": 4240.0,
+    "current_stop_loss": 4308.65,
+    "peak_price": 4330.0,
+    "is_trailing_active": true,
+    "is_closed": false,
+    "exit_price": null
+  },
+  "version": "1.2.0"
 }
 ```
 
-`alerted` maps debounce key → send time. Entries older than `STATE_RETENTION_DAYS` (14) are pruned on each write.
+`alerted` maps debounce key → send time. Entries older than `STATE_RETENTION_DAYS` (14) are pruned on each write. `trailing` holds the open position's stop state (§5.6). It belongs to the position identified by `position_key` (`ENTRY_PRICE@POSITION_OZ`); a different key means a new position and starts fresh.
 
 ### 3.5 CSV input format (`DATA_SOURCE=csv`)
 
@@ -406,6 +420,64 @@ def evaluate_trade_risk_reward(entry_price, swing_low, buffer_usd=5.0, *,
 
 **Equivalent entry ceiling:** `R:R ≥ m` with target `t` holds exactly when `entry ≤ SL · m / (m − t)`. With the defaults that is `entry ≤ SL / 0.99`.
 
+### 5.6 Trailing stop (open position)
+
+Active when `TRAILING_ENABLED=true` (default), `ENTRY_PRICE` is set and `POSITION_OZ > 0`. `TrailingStopManager` is pure logic, and `GoldMonitorBot.process_trailing` handles candles, messaging and persistence.
+
+**Rules** (`entry` = `ENTRY_PRICE`, prices are 1H **closes**):
+
+| Step | Condition | Effect | Event |
+|---|---|---|---|
+| Before activation | — | Stop = `INITIAL_STOP_LOSS` (unset = no stop) | — |
+| Activation | `close ≥ entry × (1 + TRAIL_ACTIVATION_PCT/100)` (first time) | Stop = entry (break-even) | `ACTIVATED` |
+| Trail | Active, on later candles: `candidate = round(peak − entry × TRAIL_OFFSET_PCT/100, 2)`; `candidate > stop` | Stop = candidate (only ever up) | `RAISED` |
+| Exit | `close ≤ stop` | Position closed, later updates ignored | `EXIT` |
+
+`peak` is the highest close since tracking began. As in the reference implementation, activation and trailing are exclusive within one update, so the first raise comes one candle after the lock.
+
+```python
+class TrailingStopManager:
+    def update(self, current_price):
+        events = []
+        if self.is_closed:
+            return events
+        self.peak_price = max(self.peak_price, current_price)
+        if not self.is_trailing_active and current_price >= self.activation_price:
+            self.is_trailing_active, old = True, self.current_stop_loss
+            self.current_stop_loss = self.entry_price                         # break-even lock
+            events.append(TrailingEvent("ACTIVATED", current_price, self.peak_price, old, self.entry_price))
+        elif self.is_trailing_active:
+            candidate = round(self.peak_price - self.trail_offset_usd, 2)
+            if self.current_stop_loss is None or candidate > self.current_stop_loss:   # up only
+                old, self.current_stop_loss = self.current_stop_loss, candidate
+                events.append(TrailingEvent("RAISED", current_price, self.peak_price, old, candidate))
+        if self.current_stop_loss is not None and current_price <= self.current_stop_loss:
+            self.is_closed, self.exit_price = True, current_price
+            events.append(TrailingEvent("EXIT", current_price, self.peak_price,
+                                        self.current_stop_loss, self.current_stop_loss))
+        return events
+```
+
+**Per-candle processing and persistence** (`process_trailing`, called at the start of every cycle):
+
+1. Load the saved state if its `position_key` matches the configuration; otherwise start fresh. Before activation, a changed `INITIAL_STOP_LOSS` in the configuration replaces the saved stop.
+2. Select the candles newer than `last_bar`. On the first run for a position, select only the latest closed candle, since the entry time is unknown.
+3. For each candle in order: call `update(close)`, send one `sendMessage` per event, then persist the state with `last_bar = candle time`. If a send fails, `DispatchError` aborts the cycle before that candle is saved, so the candle is replayed next cycle (at-least-once delivery). The loop's normal backoff applies.
+4. After `EXIT`, the saved state has `is_closed=true`. Divergence captions then report no open position, and no further trailing alerts are sent until `ENTRY_PRICE` changes.
+
+**Exit message money figures:** "result at the stop level" is `(stop − entry) × POSITION_OZ`. The "estimated result if sold now" uses the closing price that triggered the exit, which is at or below the stop.
+
+**Differences from the reference snippet (deliberate):**
+
+| Snippet behaviour | Engine behaviour | Why |
+|---|---|---|
+| Initial stop hard-coded at $4,240 | `INITIAL_STOP_LOSS` (optional, validated `< ENTRY_PRICE`) | Per-trade value; unset supports physical-hold mode |
+| Stop hit before activation labelled "เท่าทุน" (break-even) | Labelled **ตัดขาดทุนตาม SL** | It is a loss |
+| Exit message says to sell at the SL price | Shows the SL level and an estimate at the current price | The candle already closed through the stop |
+| State only in memory | Persisted in `STATE_PATH` after each candle | Restarts keep the stop, peak and lock |
+| `requests.post` errors swallowed | Dispatcher retries (429/5xx), Markdown fallback, `DispatchError` | No silently lost exit alerts |
+| Fixed `lot_size=0.05`, `fx_rate=35.0` | `POSITION_OZ`, `USD_THB` | One source of truth for position and FX |
+
 ---
 
 ## 6. Charting Engine (In-Memory)
@@ -552,6 +624,10 @@ Bearish alerts and bullish alerts with `RR_GATE_ENABLED=false` use the same layo
 | `MIN_RR` | `--min-rr` | `1.5` | Minimum reward:risk (1 : 1.5) |
 | `RR_TARGET_GAIN_PCT` | — | `0.015` | Take-profit for the R:R gate (decimal, +1.5%) |
 | `SL_BUFFER_USD` | — | `5.0` | Stop distance below the swing low (USD/oz) |
+| `TRAILING_ENABLED` | `--no-trailing` (disables) | `true` | Trailing-stop alerts for the open position |
+| `INITIAL_STOP_LOSS` | `--initial-stop-loss` | *(unset)* | Stop before the break-even lock; must be below `ENTRY_PRICE` |
+| `TRAIL_ACTIVATION_PCT` | — | `1.0` | Gain (percent) that moves the stop to break-even |
+| `TRAIL_OFFSET_PCT` | — | `0.5` | Trailing distance below the highest close, as a percent of entry |
 | `RSI_PERIOD` / `EMA_FAST` / `EMA_SLOW` / `ATR_PERIOD` | — | `14` / `50` / `200` / `14` | Indicator periods |
 | `PIVOT_DISTANCE` | — | `5` | `find_peaks` distance |
 | `PIVOT_PROMINENCE_ATR` | — | `0.6` | Prominence as a multiple of median ATR |
@@ -692,12 +768,12 @@ ENTRYPOINT ["python", "/app/04_GOLD_BOT_MONITOR_ENGINE.py"]
 ```
 
 ```bash
-docker build -t gold-bot:1.1.0 .
-docker run --rm gold-bot:1.1.0 --self-test
+docker build -t gold-bot:1.2.0 .
+docker run --rm gold-bot:1.2.0 --self-test
 docker run -d --name gold-bot --restart unless-stopped \
   --env-file /etc/gold-bot/gold-bot.env \
   -v gold-bot-data:/data \
-  gold-bot:1.1.0
+  gold-bot:1.2.0
 docker logs -f gold-bot
 ```
 
@@ -748,10 +824,12 @@ python 04_GOLD_BOT_MONITOR_ENGINE.py --self-test ; echo "exit=$?"
 | Caption | Photo caption ≤ 1024 UTF-16 units after splitting; head + overflow reassemble losslessly; includes USD and THB P/L |
 | R:R evaluator | SL = low − $5 and TP = +1.5%; R:R 1 : 2.72 for entry 4,319 / low 4,300.20; risk $1.19 / 41.65 THB at 0.05 oz and 35 THB/USD; far entry rejected; entry below stop → invalid, evaluation still returned |
 | R:R gate | Bullish caption carries the R:R block; with a $60 buffer the same signal is rejected, nothing is sent and the key is not marked alerted |
+| Trailing manager | Entry 4,270 / SL 4,240: closes 4,280 → 4,312.70 → 4,330 → 4,325 → 4,300 → 4,400 give none / ACTIVATED / RAISED (stop 4,308.65) / none / EXIT / ignored; stop never moves down; a stop hit before activation is labelled a loss; no initial stop never exits below entry |
+| Trailing in the bot | Candle-by-candle run sends activate / raise / exit exactly once; a restart after exit sends nothing; a bot that was down replays the missed candles and sends the same three alerts |
 | Debounce | A second cycle on identical data dispatches nothing |
 | Walk-forward (informational) | Counts unique signals over 1,250 simulated bars |
 
-Exit code `0` = pass, `1` = failure (suitable for CI and for `docker run --rm gold-bot:1.1.0 --self-test` as a deployment gate).
+Exit code `0` = pass, `1` = failure (suitable for CI and for `docker run --rm gold-bot:1.2.0 --self-test` as a deployment gate).
 
 ### 12.2 Importing the module in your own tests
 

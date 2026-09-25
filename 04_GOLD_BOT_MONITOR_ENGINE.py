@@ -24,6 +24,9 @@ Signal rules (1H timeframe):
     Freshness          : the second pivot must be confirmed within the last 3 closed candles.
     R:R gate (bullish) : SL = swing low (price2) - $5 buffer, TP = entry x 1.015;
                          alert only when reward / risk >= 1.5 (sized for a 0.05 oz lot).
+    Trailing stop      : for the configured open position, +1.0% moves the stop to break-even,
+                         then the stop trails the highest 1H close by 0.5% of entry (up only);
+                         a 1H close at or below the stop triggers the exit alert.
 
 Data sources:
 
@@ -74,7 +77,7 @@ import pandas as pd  # noqa: E402
 import requests  # noqa: E402
 from scipy.signal import find_peaks  # noqa: E402
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 LOG = logging.getLogger("gold_bot")
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)  # silence font-weight fallback noise
@@ -173,6 +176,12 @@ class Config:
     rr_target_gain_pct: float = DEFAULT_TARGET_GAIN_PCT
     sl_buffer_usd: float = DEFAULT_SL_BUFFER_USD
 
+    # Trailing stop for the open position (ENTRY_PRICE / POSITION_OZ)
+    trailing_enabled: bool = True
+    initial_stop_loss: Optional[float] = None
+    trail_activation_pct: float = 1.0
+    trail_offset_pct: float = 0.5
+
     # Indicators
     rsi_period: int = 14
     ema_fast: int = 50
@@ -234,6 +243,10 @@ class Config:
             min_rr=_env_float("MIN_RR", MIN_ACCEPTABLE_RR),
             rr_target_gain_pct=_env_float("RR_TARGET_GAIN_PCT", DEFAULT_TARGET_GAIN_PCT),
             sl_buffer_usd=_env_float("SL_BUFFER_USD", DEFAULT_SL_BUFFER_USD),
+            trailing_enabled=_env_bool("TRAILING_ENABLED", True),
+            initial_stop_loss=_env_optional_float("INITIAL_STOP_LOSS"),
+            trail_activation_pct=_env_float("TRAIL_ACTIVATION_PCT", 1.0),
+            trail_offset_pct=_env_float("TRAIL_OFFSET_PCT", 0.5),
             rsi_period=_env_int("RSI_PERIOD", 14),
             ema_fast=_env_int("EMA_FAST", 50),
             ema_slow=_env_int("EMA_SLOW", 200),
@@ -290,6 +303,13 @@ class Config:
             errors.append("rr_target_gain_pct must be a decimal fraction, e.g. 0.015 for +1.5%")
         if self.sl_buffer_usd < 0:
             errors.append("sl_buffer_usd must be >= 0")
+        if self.trail_activation_pct <= 0 or self.trail_offset_pct <= 0:
+            errors.append("trail_activation_pct and trail_offset_pct must be positive (percent, e.g. 1.0)")
+        if self.initial_stop_loss is not None:
+            if self.initial_stop_loss <= 0:
+                errors.append("initial_stop_loss must be positive when set")
+            elif self.entry_price is not None and self.initial_stop_loss >= self.entry_price:
+                errors.append("initial_stop_loss must be below entry_price")
         if self.poll_seconds <= 0:
             errors.append("poll_seconds must be positive")
         try:
@@ -927,6 +947,156 @@ def evaluate_signal_rr(sig: Divergence, entry_price: float, cfg: Config) -> Tupl
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
+# Trailing stop (open position management)
+# ════════════════════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class TrailingEvent:
+    kind: str                    # "ACTIVATED" (break-even lock) | "RAISED" | "EXIT"
+    price: float                 # price that produced the event (1H close)
+    peak_price: float
+    old_stop: Optional[float]
+    new_stop: Optional[float]
+
+
+class TrailingStopManager:
+    """Break-even lock and trailing stop for one open long position. Pure logic, no I/O.
+
+    1. Before activation the stop is `initial_stop_loss` (None = no stop, the R6 physical-hold mode).
+    2. The first price >= entry x (1 + activation_pct%) moves the stop up to the entry (break-even).
+    3. On later updates the stop trails to peak - entry x offset_pct%, and it only ever moves up.
+    4. A price <= the stop closes the position (EXIT). A closed manager ignores further updates.
+    """
+
+    def __init__(self, entry_price: float, lot_size: float = LOT_SIZE_OZ, fx_rate: float = DEFAULT_USD_THB,
+                 initial_stop_loss: Optional[float] = None, activation_pct: float = 1.0,
+                 offset_pct: float = 0.5) -> None:
+        if entry_price <= 0:
+            raise ValueError("entry_price must be positive")
+        if initial_stop_loss is not None and initial_stop_loss >= entry_price:
+            raise ValueError("initial_stop_loss must be below entry_price")
+        self.entry_price = entry_price
+        self.lot_size = lot_size
+        self.fx_rate = fx_rate
+        self.initial_stop_loss = initial_stop_loss
+        self.current_stop_loss: Optional[float] = initial_stop_loss
+        self.activation_price = entry_price * (1.0 + activation_pct / 100.0)
+        self.trail_offset_usd = entry_price * offset_pct / 100.0
+        self.is_trailing_active = False
+        self.peak_price = entry_price
+        self.is_closed = False
+        self.exit_price: Optional[float] = None
+
+    def update(self, current_price: float) -> List[TrailingEvent]:
+        events: List[TrailingEvent] = []
+        if self.is_closed:
+            return events
+        if current_price > self.peak_price:
+            self.peak_price = current_price
+
+        if not self.is_trailing_active and current_price >= self.activation_price:
+            old = self.current_stop_loss
+            self.is_trailing_active = True
+            self.current_stop_loss = self.entry_price
+            events.append(TrailingEvent("ACTIVATED", current_price, self.peak_price, old, self.current_stop_loss))
+        elif self.is_trailing_active:
+            candidate = round(self.peak_price - self.trail_offset_usd, 2)
+            if self.current_stop_loss is None or candidate > self.current_stop_loss:
+                old = self.current_stop_loss
+                self.current_stop_loss = candidate
+                events.append(TrailingEvent("RAISED", current_price, self.peak_price, old, candidate))
+
+        if self.current_stop_loss is not None and current_price <= self.current_stop_loss:
+            self.is_closed = True
+            self.exit_price = current_price
+            events.append(TrailingEvent("EXIT", current_price, self.peak_price, self.current_stop_loss,
+                                        self.current_stop_loss))
+        return events
+
+    def pnl_usd(self, price: float) -> float:
+        return (price - self.entry_price) * self.lot_size
+
+    def pnl_thb(self, price: float) -> float:
+        return self.pnl_usd(price) * self.fx_rate
+
+    def to_state(self) -> Dict[str, object]:
+        return {
+            "initial_stop_loss": self.initial_stop_loss, "current_stop_loss": self.current_stop_loss,
+            "peak_price": self.peak_price, "is_trailing_active": self.is_trailing_active,
+            "is_closed": self.is_closed, "exit_price": self.exit_price,
+        }
+
+    def restore(self, data: Dict[str, object]) -> None:
+        """Restore dynamic state saved by to_state(). Before activation, a changed initial stop in the
+        configuration wins over the saved one, so the user can move the stop by editing the config."""
+        self.peak_price = float(data.get("peak_price", self.entry_price))
+        self.is_trailing_active = bool(data.get("is_trailing_active", False))
+        self.is_closed = bool(data.get("is_closed", False))
+        exit_price = data.get("exit_price")
+        self.exit_price = None if exit_price is None else float(exit_price)
+        saved_stop = data.get("current_stop_loss")
+        if self.is_trailing_active or data.get("initial_stop_loss") == self.initial_stop_loss:
+            self.current_stop_loss = None if saved_stop is None else float(saved_stop)
+
+
+def format_trailing_message(ev: TrailingEvent, mgr: TrailingStopManager, bar_time: pd.Timestamp,
+                            cfg: Config) -> str:
+    """Thai-language Telegram text (legacy Markdown) for one trailing-stop event."""
+    ts = bar_time.tz_convert(ZoneInfo(cfg.display_tz))
+    stamp = f"*{md_escape(cfg.symbol_label)}* · แท่ง 1H `{ts:%d %b %Y %H:%M}` · {mgr.lot_size:.2f} oz @ " \
+            f"`{fmt_usd(mgr.entry_price)}`"
+    if ev.kind == "ACTIVATED":
+        profit_usd = mgr.pnl_usd(ev.price)
+        prior = f" (เดิม `{fmt_usd(ev.old_stop)}`)" if ev.old_stop is not None else ""
+        return "\n".join([
+            f"🛡️ *[ล็อกทุนเรียบร้อย] ราคาทองบวกทะลุ +{cfg.trail_activation_pct:.1f}%*",
+            stamp,
+            "",
+            f"💰 ราคาปัจจุบัน: `{fmt_usd(ev.price)}`",
+            f"📈 จุดสูงสุด: `{fmt_usd(ev.peak_price)}`",
+            f"🔒 *เลื่อน Stop Loss ใหม่มาที่:* `{fmt_usd(ev.new_stop)}` (ราคาต้นทุน){prior}",
+            f"💵 กำไรทางบัญชีขณะนี้: `{fmt_usd(profit_usd, True)} USD` (~`{profit_usd * mgr.fx_rate:+,.0f} บาท`)",
+            "",
+            "📌 *สถานะ:* ไม้นี้ไม่มีความเสี่ยงขาดทุนแล้ว (ยกเว้นราคากระโดดผ่าน SL) "
+            "กำลังรันระบบ Trailing Stop ตามกำไรต่อ",
+        ])
+    if ev.kind == "RAISED":
+        locked_usd = mgr.pnl_usd(ev.new_stop)
+        old = fmt_usd(ev.old_stop) if ev.old_stop is not None else "ไม่มี"
+        return "\n".join([
+            "🚀 *[ยกจุดล็อกกำไรสูงขึ้น] Trailing Stop Updated*",
+            stamp,
+            "",
+            f"📈 ราคาสูงสุดใหม่: `{fmt_usd(ev.peak_price)}`",
+            f"⬆️ ขยับ Stop Loss: `{old}` ➔ `{fmt_usd(ev.new_stop)}`",
+            f"💰 การันตีกำไรขั้นต่ำในมือ: `{fmt_usd(locked_usd, True)} USD` (~`{locked_usd * mgr.fx_rate:+,.0f} บาท`)",
+        ])
+    stop = float(ev.new_stop)
+    at_stop_usd = mgr.pnl_usd(stop)
+    at_price_usd = mgr.pnl_usd(ev.price)
+    if stop > mgr.entry_price + 0.005:
+        label = "ล็อกกำไรสำเร็จ"
+    elif stop >= mgr.entry_price - 0.005:
+        label = "ปิดสถานะเท่าทุน (เสมอตัว)"
+    else:
+        label = "ตัดขาดทุนตาม SL"
+    return "\n".join([
+        f"🎯 *[สั่งปิดสถานะ - {label}]*",
+        stamp,
+        "",
+        f"📉 แท่ง 1H ปิดแตะ/หลุด SL: `{fmt_usd(ev.price)}`",
+        f"🚪 ระดับ SL ที่ถูกแตะ: `{fmt_usd(stop)}` (ผลลัพธ์ที่ระดับนี้ `{fmt_usd(at_stop_usd, True)} USD` "
+        f"~`{at_stop_usd * mgr.fx_rate:+,.0f} บาท`)",
+        f"💵 ผลลัพธ์โดยประมาณถ้ากดขายบน Gold Wallet ตอนนี้: `{fmt_usd(at_price_usd, True)} USD` "
+        f"(~`{at_price_usd * mgr.fx_rate:+,.0f} บาท`)",
+        "",
+        "💡 แนะนำเข้าไปกดขายบนแอปเป๋าตังเพื่อดึงเงินสดกลับเข้า FCD รอสัญญาณรอบใหม่ครับ",
+        "⚙️ หลังขายแล้ว ให้ลบค่า ENTRY\\_PRICE ในการตั้งค่าบอทแล้วรีสตาร์ท",
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
 # Chart rendering (in memory only)
 # ════════════════════════════════════════════════════════════════════════════════════════════
 
@@ -1199,6 +1369,13 @@ class TelegramDispatcher:
                 # The chart and key figures are already delivered; do not re-send the whole alert.
                 LOG.error("Follow-up message failed (alert photo was delivered): %s", exc)
 
+    def send_message(self, text: str) -> None:
+        """Plain Telegram text message (used for trailing-stop alerts)."""
+        if not self.cfg.telegram_enabled:
+            LOG.info("[DRY-RUN] sendMessage suppressed:\n%s", text)
+            return
+        self._post("sendMessage", {"text": text}, "text")
+
     def _post(self, method: str, fields: Dict[str, str], text_field: str, files: Optional[dict] = None) -> None:
         url = f"{TELEGRAM_API_BASE}/bot{self.cfg.telegram_token}/{method}"
         parse_mode: Optional[str] = "Markdown"
@@ -1267,6 +1444,7 @@ class StateStore:
         self._lock = threading.Lock()
         self.alerted: Dict[str, str] = {}
         self.last_by_kind: Dict[str, str] = {}
+        self.trailing: Dict[str, object] = {}
         self._load()
 
     def _load(self) -> None:
@@ -1277,9 +1455,11 @@ class StateStore:
                 data = json.load(fh)
             self.alerted = {str(k): str(v) for k, v in data.get("alerted", {}).items()}
             self.last_by_kind = {str(k): str(v) for k, v in data.get("last_by_kind", {}).items()}
-        except (OSError, ValueError) as exc:
+            trailing = data.get("trailing", {})
+            self.trailing = dict(trailing) if isinstance(trailing, dict) else {}
+        except (OSError, ValueError, AttributeError) as exc:
             LOG.error("State file %s unreadable (%s); starting with empty state.", self.path, exc)
-            self.alerted, self.last_by_kind = {}, {}
+            self.alerted, self.last_by_kind, self.trailing = {}, {}, {}
 
     def _save(self) -> None:
         if not self.path:
@@ -1290,7 +1470,7 @@ class StateStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"alerted": self.alerted, "last_by_kind": self.last_by_kind,
-                           "version": __version__}, fh, indent=2, sort_keys=True)
+                           "trailing": self.trailing, "version": __version__}, fh, indent=2, sort_keys=True)
             os.replace(tmp, self.path)
         except BaseException:
             if os.path.exists(tmp):
@@ -1315,6 +1495,15 @@ class StateStore:
             self.alerted = {k: v for k, v in self.alerted.items() if datetime.fromisoformat(v) >= cutoff}
             self._save()
 
+    def get_trailing(self) -> Dict[str, object]:
+        with self._lock:
+            return dict(self.trailing)
+
+    def set_trailing(self, data: Dict[str, object]) -> None:
+        with self._lock:
+            self.trailing = dict(data)
+            self._save()
+
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # Orchestration
@@ -1337,6 +1526,47 @@ class GoldMonitorBot:
         LOG.info("Stop requested; finishing current cycle.")
         self._stop.set()
 
+    def _position_key(self) -> str:
+        return f"{self.cfg.entry_price:.2f}@{self.cfg.position_oz:.4f}"
+
+    def _load_trailing(self) -> Tuple[Optional[TrailingStopManager], Optional[pd.Timestamp]]:
+        """Manager for the configured position plus the last processed candle, or (None, None)."""
+        cfg = self.cfg
+        if not (cfg.trailing_enabled and cfg.entry_price is not None and cfg.position_oz > 0):
+            return None, None
+        mgr = TrailingStopManager(cfg.entry_price, cfg.position_oz, cfg.usd_thb, cfg.initial_stop_loss,
+                                  cfg.trail_activation_pct, cfg.trail_offset_pct)
+        saved = self.state.get_trailing()
+        if saved.get("position_key") != self._position_key():
+            return mgr, None                      # new position: fresh state
+        mgr.restore(saved)
+        last_bar = saved.get("last_bar")
+        return mgr, (pd.Timestamp(str(last_bar)) if last_bar else None)
+
+    def process_trailing(self, df_ind: pd.DataFrame) -> List[TrailingEvent]:
+        """Feed every newly closed candle to the trailing manager and send one message per event.
+
+        State (stop, peak, activation, last processed candle) is persisted after each candle whose
+        messages were all delivered, so restarts neither lose the stop nor repeat alerts. On the
+        first run for a position only the latest closed candle is processed (entry time unknown).
+        """
+        mgr, last_bar = self._load_trailing()
+        if mgr is None or mgr.is_closed:
+            return []
+        bars = df_ind.iloc[-1:] if last_bar is None else df_ind[df_ind.index > last_bar]
+        events: List[TrailingEvent] = []
+        for ts, row in bars.iterrows():
+            for ev in mgr.update(float(row["close"])):
+                LOG.info("Trailing %s at %.2f: stop %s -> %s (peak %.2f)", ev.kind, ev.price, ev.old_stop,
+                         ev.new_stop, ev.peak_price)
+                self.dispatcher.send_message(format_trailing_message(ev, mgr, ts, self.cfg))
+                events.append(ev)
+            self.state.set_trailing({"position_key": self._position_key(), "last_bar": ts.isoformat(),
+                                     **mgr.to_state()})
+            if mgr.is_closed:
+                break
+        return events
+
     def run_cycle(self, now: Optional[datetime] = None) -> List[Divergence]:
         """One full pipeline pass. Returns the signals that were dispatched."""
         now = now or datetime.now(timezone.utc)
@@ -1348,6 +1578,12 @@ class GoldMonitorBot:
         LOG.info("Bar %s close=%.2f RSI=%.2f EMA50=%.2f EMA200=%.2f 4H=%s",
                  df_ind.index[-1].isoformat(), last["close"], last["rsi"], last["ema_fast"], last["ema_slow"],
                  ctx.regime)
+
+        self.process_trailing(df_ind)
+        mgr, _ = self._load_trailing()
+        position_entry = self.cfg.entry_price if mgr is not None and not mgr.is_closed else None
+        if mgr is None and self.cfg.entry_price is not None:
+            position_entry = self.cfg.entry_price   # trailing disabled: report the configured position
 
         dispatched: List[Divergence] = []
         for sig in self.engine.scan(df_ind):
@@ -1366,7 +1602,7 @@ class GoldMonitorBot:
                         self._rr_rejected[sig.key] = rr.reason
                     continue
                 self._rr_rejected.pop(sig.key, None)
-            pos = PositionSnapshot(self.cfg.position_oz, self.cfg.entry_price, price, self.cfg.usd_thb)
+            pos = PositionSnapshot(self.cfg.position_oz, position_entry, price, self.cfg.usd_thb)
             title = f"{self.cfg.symbol_label} 1H - {sig.kind.title()} RSI Divergence"
             png = render_signal_chart(df_ind, sig, self.cfg, title, rr)
             caption = build_caption(sig, df_ind, pos, ctx, self.cfg, rr)
@@ -1411,9 +1647,13 @@ class _RecordingDispatcher(TelegramDispatcher):
     def __init__(self, cfg: Config) -> None:
         super().__init__(cfg)
         self.sent: List[Tuple[bytes, str]] = []
+        self.messages: List[str] = []
 
     def send_photo(self, png: bytes, caption: str) -> None:
         self.sent.append((png, caption))
+
+    def send_message(self, text: str) -> None:
+        self.messages.append(text)
 
 
 class _StaticProvider:
@@ -1422,6 +1662,33 @@ class _StaticProvider:
 
     def fetch(self) -> pd.DataFrame:
         return self.df.copy()
+
+
+class _SequenceProvider:
+    """Returns the next frame on each fetch() and then keeps returning the last one."""
+
+    def __init__(self, frames: List[pd.DataFrame]) -> None:
+        self.frames = frames
+        self.i = 0
+
+    def fetch(self) -> pd.DataFrame:
+        frame = self.frames[min(self.i, len(self.frames) - 1)]
+        self.i += 1
+        return frame.copy()
+
+
+def _append_closes(base: pd.DataFrame, closes: Sequence[float]) -> pd.DataFrame:
+    """Append 1H candles with the given closes (open = previous close, $0.50 wicks)."""
+    rows = []
+    prev = float(base["close"].iloc[-1])
+    ts = base.index[-1]
+    for c in closes:
+        ts = ts + pd.Timedelta(hours=1)
+        rows.append({"timestamp": ts, "open": prev, "high": max(prev, c) + 0.5, "low": min(prev, c) - 0.5,
+                     "close": float(c), "volume": 1000.0})
+        prev = float(c)
+    extra = pd.DataFrame(rows).set_index("timestamp")
+    return pd.concat([base, extra])
 
 
 def run_self_test(cfg: Config) -> int:
@@ -1509,6 +1776,60 @@ def run_self_test(cfg: Config) -> int:
         check(all(s.kind != kind for s in stale_bot.run_cycle(now)),
               "Unconfirmed pivot (0 closing candles after it) is not signalled")
 
+    LOG.info("Self-test: trailing stop manager (entry 4,270, initial SL 4,240, +1.0% / 0.5%)")
+    mgr = TrailingStopManager(4270.0, 0.05, 35.0, initial_stop_loss=4240.0)
+    seq = [(p, [e.kind for e in mgr.update(p)]) for p in (4280.0, 4312.70, 4330.0, 4325.0, 4300.0, 4400.0)]
+    check([k for _, k in seq] == [[], ["ACTIVATED"], ["RAISED"], [], ["EXIT"], []],
+          f"Event sequence activate -> raise -> exit -> ignored ({[k for _, k in seq]})")
+    check(abs(mgr.current_stop_loss - 4308.65) < 1e-9 and abs(mgr.trail_offset_usd - 21.35) < 1e-9,
+          "Stop trails peak 4,330.00 - 0.5% x 4,270 = 4,308.65")
+    check(abs(mgr.pnl_thb(mgr.current_stop_loss) - 67.6375) < 1e-9, "Locked profit at stop: +$1.93 / +67.64 THB")
+    down = TrailingStopManager(4270.0, 0.05, 35.0, initial_stop_loss=4240.0)
+    down.update(4313.0)
+    down.update(4340.0)
+    stop_after_peak = down.current_stop_loss
+    down.update(4335.0)
+    check(down.current_stop_loss == stop_after_peak, "Stop never moves down when price retreats above it")
+    loss = TrailingStopManager(4270.0, 0.05, 35.0, initial_stop_loss=4240.0)
+    ev_loss = loss.update(4235.0)
+    loss_msg = format_trailing_message(ev_loss[-1], loss, pd.Timestamp("2026-09-24 10:00", tz="UTC"), cfg)
+    check([e.kind for e in ev_loss] == ["EXIT"] and "ตัดขาดทุนตาม SL" in loss_msg,
+          "Initial stop hit before activation is labelled a loss, not break-even")
+    hold = TrailingStopManager(4270.0, 0.05, 35.0)
+    check(hold.update(4000.0) == [] and not hold.is_closed, "No initial stop (physical hold) never exits below entry")
+
+    LOG.info("Self-test: trailing stop inside the bot (per-candle, persisted, restart-safe)")
+    lead = generate_simulated_ohlcv(300, 4270.0, cfg.sim_seed + 5)
+    lead[["open", "high", "low", "close"]] *= 4270.0 / lead["close"].iloc[-1]   # end the lead-in at the entry
+    tail = [4280.0, 4312.70, 4330.0, 4325.0, 4300.0]
+    frames = [_append_closes(lead, tail[: k + 1]) for k in range(len(tail))]
+    trail_cfg = dataclasses.replace(cfg, entry_price=4270.0, position_oz=0.05, usd_thb=35.0,
+                                    initial_stop_loss=4240.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        state_file = os.path.join(tmp, "state.json")
+        rec = _RecordingDispatcher(trail_cfg)
+        tbot = GoldMonitorBot(trail_cfg, provider=_SequenceProvider(frames), dispatcher=rec,
+                              state=StateStore(state_file, 0, 14))
+        for _ in frames:
+            tbot.run_cycle(datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc))
+        kinds = ["ACTIVATED" if "ล็อกทุน" in m else "RAISED" if "Trailing Stop Updated" in m else
+                 "EXIT" if "สั่งปิดสถานะ" in m else "?" for m in rec.messages]
+        check(kinds == ["ACTIVATED", "RAISED", "EXIT"], f"Bot sends activate / raise / exit once each ({kinds})")
+        check(bool(rec.messages) and "ล็อกกำไรสำเร็จ" in rec.messages[-1] and "4,308.65" in rec.messages[-1],
+              "Exit message: profit label and stop level $4,308.65")
+        rec2 = _RecordingDispatcher(trail_cfg)
+        restarted = GoldMonitorBot(trail_cfg, provider=_SequenceProvider([frames[-1]]), dispatcher=rec2,
+                                   state=StateStore(state_file, 0, 14))
+        restarted.run_cycle(datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc))
+        check(rec2.messages == [], "Restart after exit: closed position is not re-alerted")
+
+        rec3 = _RecordingDispatcher(trail_cfg)
+        catch_up = GoldMonitorBot(trail_cfg, provider=_SequenceProvider([frames[0], frames[-1]]), dispatcher=rec3,
+                                  state=StateStore(os.path.join(tmp, "s2.json"), 0, 14))
+        catch_up.run_cycle(datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc))
+        catch_up.run_cycle(datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc))
+        check(len(rec3.messages) == 3, f"Catch-up after downtime replays missed candles ({len(rec3.messages)} msgs)")
+
     LOG.info("Self-test: walk-forward scan over simulated history (informational)")
     engine = DivergenceEngine(cfg)
     full = compute_indicators(generate_simulated_ohlcv(1500, cfg.sim_start_price, cfg.sim_seed), cfg)
@@ -1547,6 +1868,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lot-size-oz", type=float, help="lot size (oz) used for the R:R money figures")
     p.add_argument("--min-rr", type=float, help="minimum reward:risk for bullish alerts (e.g. 1.5)")
     p.add_argument("--no-rr-gate", action="store_true", help="send bullish alerts without the R:R filter")
+    p.add_argument("--initial-stop-loss", type=float, help="stop for the open position before break-even lock")
+    p.add_argument("--no-trailing", action="store_true", help="disable trailing-stop alerts")
     p.add_argument("--poll-seconds", type=float, help="seconds between cycles")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"), help="DEBUG|INFO|WARNING|ERROR")
     return p
@@ -1565,9 +1888,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "data_source": args.source, "csv_path": args.csv_path, "state_path": args.state_path,
             "position_oz": args.position_oz, "entry_price": args.entry_price, "usd_thb": args.usd_thb,
             "poll_seconds": args.poll_seconds, "lot_size_oz": args.lot_size_oz, "min_rr": args.min_rr,
+            "initial_stop_loss": args.initial_stop_loss,
         }.items() if v is not None}
         if args.no_rr_gate:
             overrides["rr_gate_enabled"] = False
+        if args.no_trailing:
+            overrides["trailing_enabled"] = False
         if args.dry_run:
             overrides["dry_run"] = True
         cfg = dataclasses.replace(cfg, **overrides)
